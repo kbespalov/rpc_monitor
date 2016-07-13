@@ -1,6 +1,5 @@
 import argparse
 
-import datetime
 from oslo_config import cfg
 from monitor import RPCStateMonitor
 

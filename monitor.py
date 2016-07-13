@@ -18,29 +18,30 @@ class RPCStateMonitor(object):
         # repository for storing and processing incoming state samples
         self.repository = InfluxDBStateRepository(config.poll_delay)
         self.callbacks_routes = {'sample': self.repository.on_incoming}
-        self.client = RPCStateClient(self.on_incoming)
         # setup workers for processing incoming states
         self.incoming = Queue.Queue()
-        print config.workers
+        self.client = RPCStateClient(self.on_incoming)
         self.workers = ThreadPoolExecutor(config.workers)
         for _ in xrange(config.workers):
             self.workers.submit(self.worker)
         # setup periodic poller with specified delay
+
         self.poll_delay = config.poll_delay
-        self.periodic_updates = Thread(target=self.update_rpc_state)
-        self.periodic_updates.start()
+        if not config.listener_only:
+            self.periodic_updates = Thread(target=self.update_rpc_state)
+            self.periodic_updates.start()
 
     def worker(self):
         while True:
-            response = self.incoming.get()
-            print response
+            resp_time, response = self.incoming.get()
             msg_type = response['msg_type']
-            self.callbacks_routes[msg_type](response)
+            self.callbacks_routes[msg_type](resp_time, response)
 
     @staticmethod
     def setup_config():
         opts = [cfg.IntOpt(name='poll_delay', default=60),
-                cfg.IntOpt(name='workers', default=30)]
+                cfg.IntOpt(name='workers', default=30),
+                cfg.BoolOpt('listener_only', default=False)]
         config = cfg.CONF
         config.register_opts(opts)
         return config
@@ -48,7 +49,7 @@ class RPCStateMonitor(object):
     def on_incoming(self, msg):
         response = msg['result']
         if response:
-            self.incoming.put(response)
+            self.incoming.put((time.time(), response))
         else:
             print 'Failed process message: %s ' % str(msg)
 

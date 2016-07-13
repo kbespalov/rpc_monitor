@@ -40,7 +40,6 @@ class RabbitAPIClient(object):
         return config.rabbit_monitor
 
     def _get(self, resource, data=None):
-        print self.api % resource
         r = requests.get(self.api % resource, data, auth=self.auth)
         if r.status_code == 200:
             return r.json()
@@ -141,18 +140,13 @@ class RPCStateClient(object):
         msg = self._create_call_msg('rpc_stats', args)
         self._publish(msg, exchange, routing_key)
 
-    def call_private_method(self, request_time, exchange=None, routing_key=None):
-        args = {'request_time': request_time}
-        msg = self._create_call_msg('__hash__', args)
-        self._publish(msg, exchange, routing_key)
-
 
 class RPCStateConsumer(object):
     def __init__(self, amqp_url, on_incoming):
         self.params = pika.URLParameters(amqp_url)
         self.connection = pika.BlockingConnection(parameters=self.params)
         self.channel = self.connection.channel()
-        self.reply_to = "rpc_state.reply_%s" % str(uuid.uuid4())
+        self.reply_to = "rpc_state.reply"
         self.exchange_bindings = []
         self.on_incoming = on_incoming
         self._setup_reply_queue()
@@ -174,7 +168,7 @@ class RPCStateConsumer(object):
 
     def _on_message(self, ch, method_frame, header_frame, body):
         body = json.loads(body)
-        self.on_incoming(body['oslo.message'])
+        self.on_incoming(json.loads(body['oslo.message']))
 
     def start(self):
         self.consumer_thread.start()

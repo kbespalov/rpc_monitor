@@ -12,7 +12,7 @@ from state.base import loop_bucket
 class InfluxDBReporter(object):
     def __init__(self):
         self.conf = self.setup_conf()
-        self.samples_queue = Queue(maxsize=1000)
+        self.samples_queue = Queue(maxsize=5000)
         self.influx_client = InfluxDBClient(self.conf.host,
                                             self.conf.port,
                                             self.conf.user,
@@ -58,17 +58,19 @@ class InfluxDBReporter(object):
             batch = []
 
 
-class InfluxDBStateRepository(InfluxDBReporter):
-    def __init__(self, update_time):
-        super(InfluxDBStateRepository, self).__init__()
-        self.worker_timeout = max(update_time, 120)  # (s)
+class StateWatcher(object):
+    def __init__(self, influx_client, samples_queue, update_time):
+        self.is_running = False
+        self.samples_queue = samples_queue
+        self.influx_client = influx_client
         self.new_workers, self.die_workers = self._workers_events()
+        self.worker_thread = Thread(target=self.worker)
+        self.worker_timeout = max(update_time, 120)  # (s)
 
-    @staticmethod
-    def over_methods(sample):
-        for endpoint, methods in sample['endpoints'].iteritems():
-            for method, state in methods.iteritems():
-                yield endpoint, method, state
+    def worker(self):
+        while True:
+            self.report_workers_state()
+            time.sleep(self.worker_timeout)
 
     def _as_id(self, tags):
         return '|'.join([tags['process_name'], tags['host'], tags['wid']])
@@ -89,8 +91,7 @@ class InfluxDBStateRepository(InfluxDBReporter):
         # needs to detect new workers
         q = 'select count(latency) from response_time WHERE %s GROUP BY wid, host, process_name'
         # needs to detect die workers
-        l = 'select last(response),wid,host,process_name ' \
-            'from response_time Where %s GROUP BY wid, host, process_name'
+        l = 'select last(response),wid,host,process_name from response_time Where %s GROUP BY wid, host, process_name'
 
         def detect_die():
             _latest = self.influx_client.query(l % 'time > now() - 1h')
@@ -132,33 +133,53 @@ class InfluxDBStateRepository(InfluxDBReporter):
         self.new_workers |= new_workers
         self.die_workers |= die_workers
 
-        report_workers(new_workers, 'new')
-        report_workers(die_workers, 'die')
+        report_workers(new_workers, 'up')
+        report_workers(die_workers, 'down')
 
-    def report_response_time(self, msg):
-        response_time = time.time()
+    def start(self):
+        self.worker_thread.start()
+
+    def stop(self):
+        # unstoppable ;)
+        pass
+
+
+class InfluxDBStateRepository(InfluxDBReporter):
+    def __init__(self, update_time):
+        super(InfluxDBStateRepository, self).__init__()
+        self.state_watcher = StateWatcher(self.influx_client, self.samples_queue, update_time)
+        self.state_watcher.start()
+
+    @staticmethod
+    def over_methods(sample):
+        for endpoint, methods in sample['endpoints'].iteritems():
+            for method, state in methods.iteritems():
+                yield endpoint, method, state
+
+    def report_response_time(self, resp_time, msg):
         request_time = msg['req_time']
         self.samples_queue.put({
             'measurement': 'response_time',
-            'time': int(response_time * 10 ** 9),
+            'time': int(resp_time * 10 ** 9),
             'tags': {
                 'host': msg['hostname'],
                 'wid': msg['wid'],
                 'process_name': msg['proc_name'],
             },
             'fields': {
-                'latency': (response_time - request_time),
-                'response': response_time
+                'latency': (resp_time - request_time),
+                'response': resp_time
             }
         })
 
     def report_rpc_stats(self, msg):
         for endpoint, method, state in self.over_methods(msg):
+
             aligned_time = int(state['latest_call'] - state['latest_call'] % msg['granularity'])
             for bucket in reversed(state['distribution']):
                 method_sample = {
                     'measurement': 'rpc_method',
-                    'time': aligned_time * 10 ** 9,
+                    'time': aligned_time * 1000000000,
                     'tags': {
                         'topic': msg['topic'],
                         'server': msg['server'],
@@ -172,13 +193,65 @@ class InfluxDBStateRepository(InfluxDBReporter):
                         'avg': float(loop_bucket.get_avg(bucket)),
                         'max': float(loop_bucket.get_max(bucket)),
                         'min': float(loop_bucket.get_min(bucket)),
-                        'cnt': float(loop_bucket.get_cnt(bucket))
+                        'cnt': loop_bucket.get_cnt(bucket)
                     }
                 }
                 self.samples_queue.put(method_sample)
                 aligned_time -= msg['granularity']
 
-    def on_incoming(self, state_sample):
-        self.report_response_time(state_sample)
+    def on_incoming(self, resp_time, state_sample):
+        # todo: make it thread safe
+        self.report_response_time(resp_time, state_sample)
         self.report_rpc_stats(state_sample)
-        self.report_workers_state()
+        self.report_processing_delay(state_sample)
+        self.report_reply_delay(state_sample)
+
+    def report_processing_delay(self, msg):
+        delay_state = msg['proc_delay']
+        aligned_time = int(delay_state['latest_call'] - delay_state['latest_call'] % msg['granularity'])
+        for bucket in reversed(delay_state['distribution']):
+            if loop_bucket.get_cnt(bucket):
+                method_sample = {
+                    'measurement': 'processing_delay',
+                    'time': aligned_time * 1000000000,
+                    'tags': {
+                        'topic': msg['topic'],
+                        'server': msg['server'],
+                        'host': msg['hostname'],
+                        'wid': msg['wid'],
+                        'process_name': msg['proc_name']
+                    },
+                    'fields': {
+                        'avg': float(loop_bucket.get_avg(bucket)),
+                        'sum': loop_bucket.get_cnt(bucket) * float(loop_bucket.get_avg(bucket)),
+                        'max': float(loop_bucket.get_max(bucket)),
+                        'min': float(loop_bucket.get_min(bucket)),
+                        'cnt': loop_bucket.get_cnt(bucket)
+                    }
+                }
+                self.samples_queue.put(method_sample)
+            aligned_time -= msg['granularity']
+
+    def report_reply_delay(self, msg):
+        delay_state = msg['reply_delay']
+        aligned_time = int(delay_state['latest_call'] - delay_state['latest_call'] % msg['granularity'])
+        for bucket in reversed(delay_state['distribution']):
+            method_sample = {
+                'measurement': 'reply_delay',
+                'time': aligned_time * 1000000000,
+                'tags': {
+                    'topic': msg['topic'],
+                    'server': msg['server'],
+                    'host': msg['hostname'],
+                    'wid': msg['wid'],
+                    'process_name': msg['proc_name']
+                },
+                'fields': {
+                    'avg': float(loop_bucket.get_avg(bucket)),
+                    'max': float(loop_bucket.get_max(bucket)),
+                    'min': float(loop_bucket.get_min(bucket)),
+                    'cnt': loop_bucket.get_cnt(bucket)
+                }
+            }
+            self.samples_queue.put(method_sample)
+            aligned_time -= msg['granularity']
