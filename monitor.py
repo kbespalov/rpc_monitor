@@ -22,9 +22,9 @@ class RPCStateMonitor(object):
         self.incoming = Queue.Queue()
         self.client = RPCStateClient(self.on_incoming)
         self.workers = ThreadPoolExecutor(config.workers)
+
         for _ in xrange(config.workers):
             self.workers.submit(self.worker)
-        # setup periodic poller with specified delay
 
         self.poll_delay = config.poll_delay
         if not config.listener_only:
@@ -40,8 +40,8 @@ class RPCStateMonitor(object):
     @staticmethod
     def setup_config():
         opts = [cfg.IntOpt(name='poll_delay', default=60),
-                cfg.IntOpt(name='workers', default=30),
-                cfg.BoolOpt('listener_only', default=False)]
+                cfg.IntOpt(name='workers', default=8),
+                cfg.BoolOpt(name='listener_only', default=False)]
         config = cfg.CONF
         config.register_opts(opts)
         return config

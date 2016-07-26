@@ -5,7 +5,7 @@ import time
 
 from influxdb import InfluxDBClient
 from oslo_config import cfg
-
+from concurrent.futures import ThreadPoolExecutor
 from state.base import loop_bucket
 
 
@@ -20,8 +20,9 @@ class InfluxDBReporter(object):
                                             self.conf.db)
 
         self.influx_client.create_database(self.conf.db)
-        self.sender = Thread(target=self._sample_sender)
-        self.sender.start()
+        self.pool = ThreadPoolExecutor(4)
+        for _ in range(4):
+            self.pool.submit(self._sample_sender)
 
     @staticmethod
     def setup_conf():
@@ -36,6 +37,7 @@ class InfluxDBReporter(object):
         config = cfg.CONF
         config.register_group(opt_group)
         config.register_opts(opts, group=opt_group)
+
         return config.influx_repository
 
     def _populate_batch(self, batch, max_size=1000):
@@ -48,6 +50,7 @@ class InfluxDBReporter(object):
                     break
         except Empty:
             pass
+        print len(batch)
 
     def _sample_sender(self):
         batch = []
@@ -88,6 +91,7 @@ class StateWatcher(object):
         return new, die
 
     def report_workers_state(self):
+
         # needs to detect new workers
         q = 'select count(latency) from response_time WHERE %s GROUP BY wid, host, process_name'
         # needs to detect die workers
@@ -174,33 +178,35 @@ class InfluxDBStateRepository(InfluxDBReporter):
 
     def report_rpc_stats(self, msg):
         for endpoint, method, state in self.over_methods(msg):
-
             aligned_time = int(state['latest_call'] - state['latest_call'] % msg['granularity'])
             for bucket in reversed(state['distribution']):
-                method_sample = {
-                    'measurement': 'rpc_method',
-                    'time': aligned_time * 1000000000,
-                    'tags': {
-                        'topic': msg['topic'],
-                        'server': msg['server'],
-                        'host': msg['hostname'],
-                        'wid': msg['wid'],
-                        'process_name': msg['proc_name'],
-                        'endpoint': endpoint,
-                        'method': method
-                    },
-                    'fields': {
-                        'avg': float(loop_bucket.get_avg(bucket)),
-                        'max': float(loop_bucket.get_max(bucket)),
-                        'min': float(loop_bucket.get_min(bucket)),
-                        'cnt': loop_bucket.get_cnt(bucket)
+                if loop_bucket.get_cnt(bucket):
+                    if not float(loop_bucket.get_min(bucket)):
+                        print float(loop_bucket.get_min(bucket))
+                    method_sample = {
+                        'measurement': 'rpc_method',
+                        'time': aligned_time * 1000000000,
+                        'tags': {
+                            'topic': msg['topic'],
+                            'server': msg['server'],
+                            'host': msg['hostname'],
+                            'wid': msg['wid'],
+                            'process_name': msg['proc_name'],
+                            'endpoint': endpoint,
+                            'method': method
+                        },
+                        'fields': {
+                            'avg': float(loop_bucket.get_avg(bucket)),
+                            'sum': loop_bucket.get_cnt(bucket) * float(loop_bucket.get_avg(bucket)),
+                            'max': float(loop_bucket.get_max(bucket)),
+                            'min': float(loop_bucket.get_min(bucket)),
+                            'cnt': loop_bucket.get_cnt(bucket)
+                        }
                     }
-                }
-                self.samples_queue.put(method_sample)
+                    self.samples_queue.put(method_sample)
                 aligned_time -= msg['granularity']
 
     def on_incoming(self, resp_time, state_sample):
-        # todo: make it thread safe
         self.report_response_time(resp_time, state_sample)
         self.report_rpc_stats(state_sample)
         self.report_processing_delay(state_sample)
@@ -236,22 +242,24 @@ class InfluxDBStateRepository(InfluxDBReporter):
         delay_state = msg['reply_delay']
         aligned_time = int(delay_state['latest_call'] - delay_state['latest_call'] % msg['granularity'])
         for bucket in reversed(delay_state['distribution']):
-            method_sample = {
-                'measurement': 'reply_delay',
-                'time': aligned_time * 1000000000,
-                'tags': {
-                    'topic': msg['topic'],
-                    'server': msg['server'],
-                    'host': msg['hostname'],
-                    'wid': msg['wid'],
-                    'process_name': msg['proc_name']
-                },
-                'fields': {
-                    'avg': float(loop_bucket.get_avg(bucket)),
-                    'max': float(loop_bucket.get_max(bucket)),
-                    'min': float(loop_bucket.get_min(bucket)),
-                    'cnt': loop_bucket.get_cnt(bucket)
+            if loop_bucket.get_cnt(bucket):
+                method_sample = {
+                    'measurement': 'reply_delay',
+                    'time': aligned_time * 1000000000,
+                    'tags': {
+                        'topic': msg['topic'],
+                        'server': msg['server'],
+                        'host': msg['hostname'],
+                        'wid': msg['wid'],
+                        'process_name': msg['proc_name']
+                    },
+                    'fields': {
+                        'avg': float(loop_bucket.get_avg(bucket)),
+                        'sum': loop_bucket.get_cnt(bucket) * float(loop_bucket.get_avg(bucket)),
+                        'max': float(loop_bucket.get_max(bucket)),
+                        'min': float(loop_bucket.get_min(bucket)),
+                        'cnt': loop_bucket.get_cnt(bucket)
+                    }
                 }
-            }
-            self.samples_queue.put(method_sample)
+                self.samples_queue.put(method_sample)
             aligned_time -= msg['granularity']
