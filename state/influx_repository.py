@@ -153,6 +153,7 @@ class InfluxDBStateRepository(InfluxDBReporter):
         super(InfluxDBStateRepository, self).__init__()
         self.state_watcher = StateWatcher(self.influx_client, self.samples_queue, update_time)
         self.state_watcher.start()
+        self.cache = {}
 
     @staticmethod
     def over_methods(sample):
@@ -176,8 +177,22 @@ class InfluxDBStateRepository(InfluxDBReporter):
             }
         })
 
+    def service_id(self, s):
+        return '|'.join([s['topic'], s['server'], s['hostname'], str(s['wid']), s['proc_name']])
+
     def report_rpc_stats(self, msg):
+        service_id = self.service_id(msg)
         for endpoint, method, state in self.over_methods(msg):
+            method_id = service_id + '.%s.%s' % (endpoint, method)
+
+            if method_id not in self.cache:
+                self.cache[method_id] = 0
+
+            if self.cache[method_id] != state['latest_call']:
+                self.cache[method_id] = state['latest_call']
+            else:
+                continue
+
             aligned_time = int(state['latest_call'] - state['latest_call'] % msg['granularity'])
             for bucket in reversed(state['distribution']):
                 if loop_bucket.get_cnt(bucket):
