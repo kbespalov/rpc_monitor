@@ -6,7 +6,7 @@ from threading import Thread
 
 from concurrent.futures import ThreadPoolExecutor
 from oslo_config import cfg
-from client.rabbit_client import RPCStateClient
+from client.rabbit_client import KombuStateClient
 from state.influx_repository import InfluxDBStateRepository
 
 LOG = logging.Logger(__name__)
@@ -20,7 +20,7 @@ class RPCStateMonitor(object):
         self.callbacks_routes = {'sample': self.repository.on_incoming}
         # setup workers for processing incoming states
         self.incoming = Queue.Queue()
-        self.client = RPCStateClient(self.on_incoming)
+        self.client = KombuStateClient(self.on_incoming)
         self.workers = ThreadPoolExecutor(config.workers)
 
         for _ in xrange(config.workers):

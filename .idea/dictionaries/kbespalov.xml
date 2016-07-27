@@ -2,6 +2,8 @@
   <dictionary name="kbespalov">
     <words>
       <w>amqp</w>
+      <w>kombu</w>
+      <w>pika</w>
       <w>poller</w>
     </words>
   </dictionary>
