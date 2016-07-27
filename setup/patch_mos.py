@@ -14,7 +14,7 @@ from api import *
 
 
 def main():
-    patched = [x.strip() for x in open('patched.txt').readlines()]
+    patched = [x.strip() for x in open('./mos_patches/patched_nodes.txt').readlines()]
 
     # PATCHED NODES PRINT
     cprint(' already patched nodes (./mos_patches/patched_nodes.txt): ')
