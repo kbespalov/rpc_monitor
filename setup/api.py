@@ -98,7 +98,7 @@ def apply_patch(nodes, filename='m.patch', revers=False, location='/usr/lib/pyth
         print execute('scp %s %s:%s' % (filename, node, location))
         print '[ apply patch to oslo.messaging %s ]' % node
         revers = '-R' if revers else ''
-        print execute("ssh %s 'cd %s && patch %s -p0 < ./%s'" % (node, location, revers, filename))
+        print execute("ssh %s 'cd %s && patch %s -p0 < %s'" % (node, location, revers, filename))
         print '[ remove patch file %s ]' % node
         print execute("ssh %s 'rm %s/%s'" % (node, location, filename))
         with open("patched.txt", "a") as myfile:
