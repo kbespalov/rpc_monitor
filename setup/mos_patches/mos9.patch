@@ -1,102 +1,53 @@
-Index: oslo_messaging/_drivers/amqpdriver.py
+Index: oslo_messaging/rpc/server.py
 IDEA additional info:
 Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 <+>UTF-8
 ===================================================================
---- oslo_messaging/_drivers/amqpdriver.py	(revision f739aa5af33b77e3718b3e594798d02cad2850a5)
-+++ oslo_messaging/_drivers/amqpdriver.py	(revision )
-@@ -58,7 +58,6 @@
-                  obsolete_reply_queues):
-         super(AMQPIncomingMessage, self).__init__(ctxt, message)
-         self.listener = listener
+--- oslo_messaging/rpc/server.py	(date 1463076029000)
++++ oslo_messaging/rpc/server.py	(revision )
+@@ -1,4 +1,3 @@
 -
-         self.unique_id = unique_id
-         self.msg_id = msg_id
-         self.reply_q = reply_q
-@@ -94,7 +93,10 @@
-                           'unique_id': unique_id,
-                           'reply_q': self.reply_q,
-                           'elapsed': self.stopwatch.elapsed()})
-+        before = time.time()
-         conn.direct_send(self.reply_q, msg)
-+        if hasattr(self, 'on_reply'):
-+            self.on_reply(time.time() - before)
- 
-     def reply(self, reply=None, failure=None, log_failure=True):
-         if not self.msg_id:
-Index: oslo_messaging/rpc/dispatcher.py
-IDEA additional info:
-Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
-<+>UTF-8
-===================================================================
---- oslo_messaging/rpc/dispatcher.py	(revision f739aa5af33b77e3718b3e594798d02cad2850a5)
-+++ oslo_messaging/rpc/dispatcher.py	(revision )
-@@ -15,7 +15,12 @@
- #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- #    License for the specific language governing permissions and limitations
- #    under the License.
-+import json
- 
-+import time
-+
+ # Copyright 2013 Red Hat, Inc.
+ #
+ #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+@@ -96,6 +95,7 @@
+ deserialize a request context and arguments from - and serialize return values
+ to - primitive types.
+ """
 +from oslo_messaging.rpc.state import RPCStateEndpoint
-+
+ 
  __all__ = [
-     'NoSuchMethod',
-     'RPCDispatcher',
-@@ -105,6 +110,7 @@
-         self.serializer = serializer or msg_serializer.NoOpSerializer()
-         self._default_target = msg_target.Target()
-         self._target = target
-+        self.state_endpoint = None
+     'get_rpc_server',
+@@ -129,8 +129,12 @@
+     :param serializer: an optional entity serializer
+     :type serializer: Serializer
+     """
++
+     dispatcher = rpc_dispatcher.RPCDispatcher(target, endpoints, serializer)
+-    return msg_server.MessageHandlingServer(transport, dispatcher, executor)
++    server = msg_server.MessageHandlingServer(transport, dispatcher, executor)
++    state_endpoint = RPCStateEndpoint(server, target)
++    dispatcher.register_state_endpoint(state_endpoint)
++    return server
  
-     def _listen(self, transport):
-         return transport._listen(self._target)
-@@ -119,21 +125,43 @@
-         return utils.version_is_compatible(endpoint_version, version)
  
-     def _do_dispatch(self, endpoint, method, ctxt, args):
-+        if not isinstance(endpoint, RPCStateEndpoint):
--        ctxt = self.serializer.deserialize_context(ctxt)
-+            ctxt = self.serializer.deserialize_context(ctxt)
-         new_args = dict()
-         for argname, arg in six.iteritems(args):
-             new_args[argname] = self.serializer.deserialize_entity(ctxt, arg)
+ def expected_exceptions(*exceptions):
+@@ -144,6 +148,7 @@
+     ExpectedException, which is used internally by the RPC sever. The RPC
+     client will see the original exception type.
+     """
 +
-+        if self.profiling_enabled():
-+            self.state_endpoint.register_method(endpoint, method)
+     def outer(func):
+         def inner(*args, **kwargs):
+             try:
+@@ -156,5 +161,7 @@
+             # ignored and thrown as normal.
+             except exceptions:
+                 raise rpc_dispatcher.ExpectedException()
 +
-         func = getattr(endpoint, method)
-         result = func(ctxt, **new_args)
-         return self.serializer.serialize_entity(ctxt, result)
- 
-+    def register_state_endpoint(self, endpoint):
-+        self.state_endpoint = endpoint
-+        self.endpoints.append(endpoint)
+         return inner
 +
-     def __call__(self, incoming):
-         incoming[0].acknowledge()
-         return dispatcher.DispatcherExecutorContext(
-             incoming[0], self._dispatch_and_reply)
- 
-+    def profiling_enabled(self):
-+        if self.state_endpoint:
-+            return self.state_endpoint.profiling_enabled()
-+        return False
-+
-     def _dispatch_and_reply(self, incoming):
-         try:
-+            if self.profiling_enabled():
-+                # NOTE(kbespalov) to measure time between message
-+                # receiving and dispatching to a method.
-+                if not hasattr(incoming, 'on_reply'):
-+                    incoming.on_reply = self.state_endpoint.log_reply_delay
-+                time_elapsed = incoming.stopwatch.elapsed()
-+                self.state_endpoint.log_processing_delay(time_elapsed)
-+
-             incoming.reply(self._dispatch(incoming.ctxt,
-                                           incoming.message))
-         except ExpectedException as e:
+     return outer
 Index: oslo_messaging/rpc/state.py
 IDEA additional info:
 Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
@@ -104,7 +55,7 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 ===================================================================
 --- oslo_messaging/rpc/state.py	(revision )
 +++ oslo_messaging/rpc/state.py	(revision )
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,249 @@
 +import functools
 +import os
 +import socket
@@ -285,14 +236,16 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 +            self.endpoints_state[name] = {}
 +        return self.endpoints_state[name]
 +
-+    def register_method(self, endpoint, method):
++    def register_method(self, endpoint, method_name):
 +        if isinstance(endpoint, RPCStateEndpoint):
 +            return
 +        endpoint_state = self.get_endpoint_state(type(endpoint).__name__)
-+        if method not in endpoint_state:
-+            rpc_method = getattr(endpoint, method)
-+            wrapped = self.rpc_stats_aware(endpoint_state, rpc_method)
-+            setattr(endpoint, method, wrapped)
++        if method_name not in endpoint_state:
++            rpc_method = getattr(endpoint, method_name)
++            wrapped = self.rpc_stats_aware(endpoint_state,
++                                           rpc_method,
++                                           method_name)
++            setattr(endpoint, method_name, wrapped)
 +
 +    def log_reply_delay(self, delay):
 +        self.reply_delay_loop.add(delay)
@@ -303,9 +256,8 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 +    def profiling_enabled(self):
 +        return self._rpc_profile
 +
-+    def rpc_stats_aware(self, stats, method):
++    def rpc_stats_aware(self, stats, method, method_name):
 +
-+        method_name = method.__name__
 +        loop = TimeLoop(self.loop_time, self.granularity)
 +        stats[method_name] = loop
 +
@@ -353,53 +305,107 @@ Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 +        sample.update(self.info)
 +        self.dump_endpoints_stats(sample)
 +        return sample
-Index: oslo_messaging/rpc/server.py
+Index: oslo_messaging/rpc/dispatcher.py
 IDEA additional info:
 Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
 <+>UTF-8
 ===================================================================
---- oslo_messaging/rpc/server.py	(revision f739aa5af33b77e3718b3e594798d02cad2850a5)
-+++ oslo_messaging/rpc/server.py	(revision )
+--- oslo_messaging/rpc/dispatcher.py	(date 1463076029000)
++++ oslo_messaging/rpc/dispatcher.py	(revision )
+@@ -15,7 +15,12 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++import json
+ 
++import time
++
++from oslo_messaging.rpc.state import RPCStateEndpoint
++
+ __all__ = [
+     'NoSuchMethod',
+     'RPCDispatcher',
+@@ -105,6 +110,7 @@
+         self.serializer = serializer or msg_serializer.NoOpSerializer()
+         self._default_target = msg_target.Target()
+         self._target = target
++        self.state_endpoint = None
+ 
+     def _listen(self, transport):
+         return transport._listen(self._target)
+@@ -119,21 +125,43 @@
+         return utils.version_is_compatible(endpoint_version, version)
+ 
+     def _do_dispatch(self, endpoint, method, ctxt, args):
++        if not isinstance(endpoint, RPCStateEndpoint):
+-        ctxt = self.serializer.deserialize_context(ctxt)
++            ctxt = self.serializer.deserialize_context(ctxt)
+         new_args = dict()
+         for argname, arg in six.iteritems(args):
+             new_args[argname] = self.serializer.deserialize_entity(ctxt, arg)
++
++        if self.profiling_enabled():
++            self.state_endpoint.register_method(endpoint, method)
++
+         func = getattr(endpoint, method)
+         result = func(ctxt, **new_args)
+         return self.serializer.serialize_entity(ctxt, result)
+ 
++    def register_state_endpoint(self, endpoint):
++        self.state_endpoint = endpoint
++        self.endpoints.append(endpoint)
++
+     def __call__(self, incoming):
+         incoming[0].acknowledge()
+         return dispatcher.DispatcherExecutorContext(
+             incoming[0], self._dispatch_and_reply)
+ 
++    def profiling_enabled(self):
++        if self.state_endpoint:
++            return self.state_endpoint.profiling_enabled()
++        return False
++
+     def _dispatch_and_reply(self, incoming):
+         try:
++            if self.profiling_enabled():
++                # NOTE(kbespalov) to measure time between message
++                # receiving and dispatching to a method.
++                if not hasattr(incoming, 'on_reply'):
++                    incoming.on_reply = self.state_endpoint.log_reply_delay
++                time_elapsed = incoming.stopwatch.elapsed()
++                self.state_endpoint.log_processing_delay(time_elapsed)
++
+             incoming.reply(self._dispatch(incoming.ctxt,
+                                           incoming.message))
+         except ExpectedException as e:
+Index: oslo_messaging/_drivers/amqpdriver.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- oslo_messaging/_drivers/amqpdriver.py	(date 1463076029000)
++++ oslo_messaging/_drivers/amqpdriver.py	(revision )
 @@ -1,4 +1,3 @@
 -
  # Copyright 2013 Red Hat, Inc.
  #
  #    Licensed under the Apache License, Version 2.0 (the "License"); you may
-@@ -96,6 +95,7 @@
- deserialize a request context and arguments from - and serialize return values
- to - primitive types.
- """
-+from oslo_messaging.rpc.state import RPCStateEndpoint
+@@ -58,7 +57,6 @@
+                  obsolete_reply_queues):
+         super(AMQPIncomingMessage, self).__init__(ctxt, message)
+         self.listener = listener
+-
+         self.unique_id = unique_id
+         self.msg_id = msg_id
+         self.reply_q = reply_q
+@@ -94,7 +92,10 @@
+                           'unique_id': unique_id,
+                           'reply_q': self.reply_q,
+                           'elapsed': self.stopwatch.elapsed()})
++        before = time.time()
+         conn.direct_send(self.reply_q, msg)
++        if hasattr(self, 'on_reply'):
++            self.on_reply(time.time() - before)
  
- __all__ = [
-     'get_rpc_server',
-@@ -129,8 +129,12 @@
-     :param serializer: an optional entity serializer
-     :type serializer: Serializer
-     """
-+
-     dispatcher = rpc_dispatcher.RPCDispatcher(target, endpoints, serializer)
--    return msg_server.MessageHandlingServer(transport, dispatcher, executor)
-+    server = msg_server.MessageHandlingServer(transport, dispatcher, executor)
-+    state_endpoint = RPCStateEndpoint(server, target)
-+    dispatcher.register_state_endpoint(state_endpoint)
-+    return server
- 
- 
- def expected_exceptions(*exceptions):
-@@ -144,6 +148,7 @@
-     ExpectedException, which is used internally by the RPC sever. The RPC
-     client will see the original exception type.
-     """
-+
-     def outer(func):
-         def inner(*args, **kwargs):
-             try:
-@@ -156,5 +161,7 @@
-             # ignored and thrown as normal.
-             except exceptions:
-                 raise rpc_dispatcher.ExpectedException()
-+
-         return inner
-+
-     return outer
+     def reply(self, reply=None, failure=None, log_failure=True):
+         if not self.msg_id:

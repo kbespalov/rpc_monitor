@@ -21,10 +21,12 @@ def main():
     for p_node in patched:
         print '--- %s' % p_node
 
+    _cm = fuel_computes()
+    _ct = fuel_controllers()
     # FILTER PATCHED NODES
     if not REVERS:
-        computes = [node for node in fuel_computes() if node not in patched]
-        controllers = [node for node in fuel_controllers() if node not in patched]
+        computes = [node for node in _cm if node not in patched]
+        controllers = [node for node in _ct if node not in patched]
         apply_patch(nodes=controllers, filename=PATCH, revers=REVERS, location=SCP_TO)
         apply_patch(nodes=computes, filename=PATCH, revers=REVERS, location=SCP_TO)
     else:
