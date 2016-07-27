@@ -102,5 +102,5 @@ def apply_patch(nodes, patch_file='./m.patch', revers=False, location='/usr/lib/
         print execute("ssh %s 'cd %s && patch %s -p0 < %s'" % (node, location, revers, file_name))
         print '[ remove patch file %s ]' % node
         print execute("ssh %s 'rm %s/%s'" % (node, location, file_name))
-        with open("patched.txt", "a") as myfile:
+        with open("./mos_patches/patched_nodes.txt", "a") as myfile:
             myfile.write(node + '\n')
