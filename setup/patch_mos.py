@@ -27,10 +27,10 @@ def main():
     if not REVERS:
         computes = [node for node in _cm if node not in patched]
         controllers = [node for node in _ct if node not in patched]
-        apply_patch(nodes=controllers, filename=PATCH, revers=REVERS, location=SCP_TO)
-        apply_patch(nodes=computes, filename=PATCH, revers=REVERS, location=SCP_TO)
+        apply_patch(nodes=controllers, patch_file=PATCH, revers=REVERS, location=SCP_TO)
+        apply_patch(nodes=computes, patch_file=PATCH, revers=REVERS, location=SCP_TO)
     else:
-        apply_patch(nodes=patched, filename=PATCH, revers=REVERS, location=SCP_TO)
+        apply_patch(nodes=patched, patch_file=PATCH, revers=REVERS, location=SCP_TO)
 
 
 main()

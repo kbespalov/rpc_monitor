@@ -92,14 +92,15 @@ def fuel_computes():
     return clean(execute("fuel nodes 2>&1 | grep compute | awk -F '|' '{ print $5 }'").split('\n'))
 
 
-def apply_patch(nodes, filename='m.patch', revers=False, location='/usr/lib/python2.7/dist-packages/'):
+def apply_patch(nodes, patch_file='./m.patch', revers=False, location='/usr/lib/python2.7/dist-packages/'):
     for node in nodes:
         print '[ copying files to %s ]' % node
-        print execute('scp %s %s:%s' % (filename, node, location))
+        print execute('scp %s %s:%s' % (patch_file, node, location))
         print '[ apply patch to oslo.messaging %s ]' % node
         revers = '-R' if revers else ''
-        print execute("ssh %s 'cd %s && patch %s -p0 < %s'" % (node, location, revers, filename))
+        file_name = os.path.basename(patch_file)
+        print execute("ssh %s 'cd %s && patch %s -p0 < %s'" % (node, location, revers, file_name))
         print '[ remove patch file %s ]' % node
-        print execute("ssh %s 'rm %s/%s'" % (node, location, filename))
+        print execute("ssh %s 'rm %s/%s'" % (node, location, file_name))
         with open("patched.txt", "a") as myfile:
             myfile.write(node + '\n')
