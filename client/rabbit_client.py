@@ -11,7 +11,6 @@ LOG = logging.getLogger('RPC State Controller')
 LOG.setLevel(logging.INFO)
 LOG.addHandler(logging.StreamHandler())
 
-
 class FetchingException(Exception):
     pass
 
@@ -165,9 +164,14 @@ class KombuStateClient(AMQPClient):
                     return True
         return False
 
-    def on_kombu_incoming(self, msg):
-        body = json.loads(msg)
-        self.on_incoming(json.loads(body['oslo.message']))
+    def on_kombu_incoming(self, incoming):
+        body = json.loads(incoming)
+        if 'oslo.message' in body:
+            message = body['oslo.message']
+            message = json.loads(message)
+            if 'result' in message:
+                return self.on_incoming(message['result'])
+        LOG.error('[kombu] Failed to process incoming message: %s' % incoming)
 
     def setup_exchange_bindings(self, exchanges):
         """Bind fanout exchanges of rpc servers to the BROADCAST_EXCHANGE """
@@ -218,11 +222,13 @@ class PikaStateClient(AMQPClient):
         if binding['routing_key'].endswith("all_workers"):
             if binding['routing_key'].startswith("with_ack"):
                 return True
-        return True
+        return False
 
-    def on_pika_incoming(self, msg):
-        print msg
-        pass
+    def on_pika_incoming(self, incoming):
+        body = json.loads(incoming)
+        if 's' in body:
+            return self.on_incoming(body['s'])
+        LOG.error('[pika] Failed to process incoming message: %s' % incoming)
 
     def update_routing_keys(self):
         LOG.info('[pika] Updating list of fanout routing keys')

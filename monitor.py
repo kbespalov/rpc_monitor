@@ -55,12 +55,8 @@ class RPCStateMonitor(object):
         elif cfg.rpc_backend == 'zmq':
             raise NotImplemented()
 
-    def on_incoming(self, msg):
-        response = msg['result']
-        if response:
-            self.incoming.put((time.time(), response))
-        else:
-            print 'Failed process message: %s ' % str(msg)
+    def on_incoming(self, response):
+        self.incoming.put((time.time(), response))
 
     def update_exchanges_list(self):
         pass
