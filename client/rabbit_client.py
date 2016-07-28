@@ -191,12 +191,12 @@ class KombuStateClient(AMQPClient):
         msg['args'] = args or {}
         return msg
 
-    def ping(self, request_time, exchange=BROADCAST_EXCHANGE, routing_key=None):
+    def ping(self, request_time, exchange=BROADCAST_EXCHANGE, routing_key=""):
         args = {'request_time': request_time}
         msg = self._create_call_msg('echo_reply', args)
         self._publish(msg, exchange, routing_key)
 
-    def get_rpc_stats(self, request_time, exchange=BROADCAST_EXCHANGE, routing_key=None):
+    def get_rpc_stats(self, request_time, exchange=BROADCAST_EXCHANGE, routing_key=""):
         args = {'request_time': request_time}
         msg = self._create_call_msg('rpc_stats', args)
         self._publish(msg, exchange, routing_key)
