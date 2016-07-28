@@ -6,7 +6,7 @@ from threading import Thread
 
 from concurrent.futures import ThreadPoolExecutor
 from oslo_config import cfg
-from client.rabbit_client import KombuStateClient
+from client.rabbit_client import KombuStateClient, PikaStateClient
 from state.influx_repository import InfluxDBStateRepository
 
 LOG = logging.Logger(__name__)
@@ -20,7 +20,7 @@ class RPCStateMonitor(object):
         self.callbacks_routes = {'sample': self.repository.on_incoming}
         # setup workers for processing incoming states
         self.incoming = Queue.Queue()
-        self.client = KombuStateClient(self.on_incoming)
+        self.client = self.build_client(config)
         self.workers = ThreadPoolExecutor(config.workers)
 
         for _ in xrange(config.workers):
@@ -37,14 +37,23 @@ class RPCStateMonitor(object):
             msg_type = response['msg_type']
             self.callbacks_routes[msg_type](resp_time, response)
 
-    @staticmethod
-    def setup_config():
+    def setup_config(self):
         opts = [cfg.IntOpt(name='poll_delay', default=60),
                 cfg.IntOpt(name='workers', default=8),
-                cfg.BoolOpt(name='listener_only', default=False)]
+                cfg.BoolOpt(name='listener_only', default=False),
+                cfg.StrOpt(name="rpc_backend", default='kombu',
+                           choices=['kombu', 'pika', 'zmq'])]
         config = cfg.CONF
         config.register_opts(opts)
         return config
+
+    def build_client(self, cfg):
+        if cfg.rpc_backend == 'kombu':
+            return KombuStateClient(self.on_incoming)
+        elif cfg.rpc_backend == 'pika':
+            return PikaStateClient(self.on_incoming)
+        elif cfg.rpc_backend == 'zmq':
+            raise NotImplemented()
 
     def on_incoming(self, msg):
         response = msg['result']
@@ -54,8 +63,9 @@ class RPCStateMonitor(object):
             print 'Failed process message: %s ' % str(msg)
 
     def update_exchanges_list(self):
-        exchanges = self.client.rabbit_client.exchanges_list()
-        self.client.setup_exchange_bindings(exchanges)
+        pass
+        # exchanges = self.client.rabbit_client.exchanges_list()
+        # self.client.setup_exchange_bindings(exchanges)
 
     def update_rpc_state(self):
         while True:

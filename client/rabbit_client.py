@@ -20,8 +20,9 @@ class RabbitAPIClient(object):
     # RabbitMQ API resources
     QUEUES = "queues"
     EXCHANGES = "exchanges"
-    QUEUE_INFO = "queues/%s/%s"
-    BINDINGS = "queues/%s/%s/bindings"
+    QUEUE_INFO = "queues/%(vhost)s/%(queue)s"
+    Q_BINDINGS = "queues/%(vhost)s/%(queue)s/bindings"
+    E_BINDINGS = "exchanges/%(vhost)s/%(exchange)s/bindings/%(type)s"
 
     def __init__(self):
         self.config = self.setup_config()
@@ -31,7 +32,7 @@ class RabbitAPIClient(object):
     @staticmethod
     def setup_config():
         opt_group = cfg.OptGroup(name='rabbit_monitor')
-        opts = [cfg.StrOpt('management_url', default='localhost:15672'),
+        opts = [cfg.StrOpt('management_url', default='http://localhost:15672'),
                 cfg.StrOpt('management_user', default='guest'),
                 cfg.StrOpt('management_pass', default='guest')]
         config = cfg.CONF
@@ -47,11 +48,14 @@ class RabbitAPIClient(object):
             raise FetchingException("Failed to get %s list: response"
                                     " code %s" % (resource, r.status_code))
 
-    def bindings_list(self, queue_name, vhost='%2F'):
-        return self._get(self.BINDINGS % (vhost, queue_name))
+    def queue_bindings_list(self, queue_name, vhost='%2F'):
+        return self._get(self.Q_BINDINGS % {'vhost': vhost, 'queue': queue_name})
+
+    def exchange_bindings_list(self, exchange_name, btype='source', vhost='%2F'):
+        return self._get(self.E_BINDINGS % {'vhost': vhost, 'exchange': exchange_name, 'type': btype})
 
     def queue_info(self, queue_name, vhost='%2F'):
-        return self._get(self.QUEUE_INFO % (vhost, queue_name))
+        return self._get(self.QUEUE_INFO % {'vhost': vhost, 'queue': queue_name})
 
     def queues_list(self, columns='name,consumers'):
         return self._get(self.QUEUES, data=dict(columns=columns))
@@ -61,15 +65,16 @@ class RabbitAPIClient(object):
 
 
 class AMQPClient(object):
+    # todo: to be configurable
+    REPLY_QUEUE = "openstack_rpc_reply"
+
     def __init__(self, on_incoming):
         self.config = self.setup_config()
         self.params = pika.URLParameters(self.config.amqp_url)
         self.connection = pika.BlockingConnection(parameters=self.params)
-        self.connection = pika.BlockingConnection(parameters=self.params)
         self.channel = self.connection.channel()
-        self.reply_listener = RPCStateConsumer(self.config.amqp_url, on_incoming)
+        self.reply_listener = AMQPConsumer(self.config.amqp_url, on_incoming, self.REPLY_QUEUE)
         self.reply_listener.start()
-        self.reply_to = self.reply_listener.reply_to
 
     @staticmethod
     def setup_config():
@@ -81,27 +86,32 @@ class AMQPClient(object):
         config.register_opts(opts, group=opt_group)
         return config.rabbit_monitor
 
-    def _publish(self, msg, exchange="", routing_key="*"):
-        properties = pika.BasicProperties(content_type='application/json')
+    def _publish(self, msg, exchange='', routing_key='*', reply_queue=None, headers=None):
+        # the kombu driver getting a reply queue from  a msg payload
+        # conversely the pika driver use message properties
+        # to store the queue
+        properties = pika.BasicProperties(content_type='application/json',
+                                          reply_to=reply_queue,
+                                          headers=headers)
         self.channel.basic_publish(exchange=exchange,
                                    routing_key=routing_key,
                                    body=json.dumps(msg),
                                    properties=properties)
 
 
-class RPCStateConsumer(object):
-    def __init__(self, amqp_url, on_incoming):
+class AMQPConsumer(object):
+    def __init__(self, amqp_url, on_incoming, reply_queue="openstack_rpc_reply"):
         self.params = pika.URLParameters(amqp_url)
         self.connection = pika.BlockingConnection(parameters=self.params)
         self.channel = self.connection.channel()
-        self.reply_to = "rpc_state.reply"
+        self.reply_to = reply_queue
         self.exchange_bindings = []
         self.on_incoming = on_incoming
         self._setup_reply_queue()
         self.consumer_thread = Thread(target=self._consume)
 
     def _setup_reply_queue(self):
-        LOG.info("[State Consumer] Setup reply queue ...")
+        LOG.info("[AMQP Consumer] Setup reply queue: %s" % self.reply_to)
         self.channel.queue_declare(self.reply_to)
         self.channel.exchange_declare(self.reply_to, 'direct',
                                       durable=False,
@@ -109,15 +119,15 @@ class RPCStateConsumer(object):
         self.channel.queue_bind(self.reply_to, self.reply_to, self.reply_to)
 
     def _consume(self):
-        LOG.info("[State Consumer] Starting consuming rpc states ...")
+        LOG.info("[AMQP Consumer] Starting consuming rpc states ...")
         self.channel.basic_consume(consumer_callback=self._on_message,
                                    no_ack=True,
                                    queue=self.reply_to)
         self.channel.start_consuming()
 
     def _on_message(self, ch, method_frame, header_frame, body):
-        body = json.loads(body)
-        self.on_incoming(json.loads(body['oslo.message']))
+        if body:
+            self.on_incoming(body)
 
     def start(self):
         self.consumer_thread.start()
@@ -132,7 +142,8 @@ class KombuStateClient(AMQPClient):
     BROADCAST_EXCHANGE = "rpc_state_broadcast"
 
     def __init__(self, on_incoming):
-        super(KombuStateClient, self).__init__(on_incoming)
+        super(KombuStateClient, self).__init__(self.on_kombu_incoming)
+        self.on_incoming = on_incoming
         self.rabbit_client = RabbitAPIClient()
         self.bindings = set()
         self._setup_publish_exchange()
@@ -140,7 +151,9 @@ class KombuStateClient(AMQPClient):
     def _setup_publish_exchange(self):
         """The client initialization """
         LOG.info("[kombu] Declare publishing exchange %s ..." % self.BROADCAST_EXCHANGE)
-        self.channel.exchange_declare(exchange=self.BROADCAST_EXCHANGE, type='fanout', durable=False)
+        self.channel.exchange_declare(exchange=self.BROADCAST_EXCHANGE,
+                                      type='fanout',
+                                      durable=False)
         exchanges = self.rabbit_client.exchanges_list()
         self.setup_exchange_bindings(exchanges)
 
@@ -151,6 +164,10 @@ class KombuStateClient(AMQPClient):
                 if exchange['name'] not in self.bindings:
                     return True
         return False
+
+    def on_kombu_incoming(self, msg):
+        body = json.loads(msg)
+        self.on_incoming(json.loads(body['oslo.message']))
 
     def setup_exchange_bindings(self, exchanges):
         """Bind fanout exchanges of rpc servers to the BROADCAST_EXCHANGE """
@@ -169,7 +186,7 @@ class KombuStateClient(AMQPClient):
         msg['method'] = method
         msg['_unique_id'] = msg_id
         msg['_msg_id'] = msg_id
-        msg['_reply_q'] = self.reply_to
+        msg['_reply_q'] = self.REPLY_QUEUE
         msg['version'] = '1.0'
         msg['args'] = args or {}
         return msg
@@ -187,9 +204,56 @@ class KombuStateClient(AMQPClient):
 
 class PikaStateClient(AMQPClient):
     # all queues of rpc servers are bind to the exchange
-    PIKA_DRIVER_MAIN_EXCHANGE = "openstack_rpc"
+    PIKA_MAIN_EXCHANGE = "openstack_rpc"
     BROADCAST_EXCHANGE = "rpc_state_broadcast"
 
     def __init__(self, on_incoming):
-        super(PikaStateClient, self).__init__(on_incoming)
+        super(PikaStateClient, self).__init__(self.on_pika_incoming)
+        self.on_incoming = on_incoming
         self.rabbit_client = RabbitAPIClient()
+        self.fanout_routing_keys = set()
+        self.update_routing_keys()
+
+    def _is_related_binding(self, binding):
+        if binding['routing_key'].endswith("all_workers"):
+            if binding['routing_key'].startswith("with_ack"):
+                return True
+        return True
+
+    def on_pika_incoming(self, msg):
+        print msg
+        pass
+
+    def update_routing_keys(self):
+        LOG.info('[pika] Updating list of fanout routing keys')
+        bindings = self.rabbit_client.exchange_bindings_list(self.PIKA_MAIN_EXCHANGE)
+        for bind in filter(self._is_related_binding, bindings):
+            key = bind['routing_key']
+            LOG.info(' -- %s ' % key)
+            self.fanout_routing_keys.add(key)
+
+    def _create_call_msg(self, method, args=None):
+        msg = dict()
+        msg['method'] = method
+        msg['args'] = args or {}
+        return msg
+
+    def ping(self, request_time, exchange=PIKA_MAIN_EXCHANGE, routing_key=None):
+        args = {'request_time': request_time}
+        msg = self._create_call_msg('echo_reply', args)
+
+        if not routing_key:
+            for key in self.fanout_routing_keys:
+                self._publish(msg, exchange, key, self.REPLY_QUEUE, {'version': '1.0'})
+        else:
+            self._publish(msg, exchange, routing_key, self.REPLY_QUEUE, {'version': '1.0'})
+
+    def get_rpc_stats(self, request_time, exchange=PIKA_MAIN_EXCHANGE, routing_key=None):
+        args = {'request_time': request_time}
+        msg = self._create_call_msg('rpc_stats', args)
+
+        if not routing_key:
+            for key in self.fanout_routing_keys:
+                self._publish(msg, exchange, key, self.REPLY_QUEUE, {'version': '1.0'})
+        else:
+            self._publish(msg, exchange, routing_key, self.REPLY_QUEUE, {'version': '1.0'})
