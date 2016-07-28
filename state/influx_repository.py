@@ -2,12 +2,15 @@ from Queue import Queue, Empty
 from threading import Thread
 
 import time
-
+import logging
 from influxdb import InfluxDBClient
 from oslo_config import cfg
 from concurrent.futures import ThreadPoolExecutor
 from state.base import loop_bucket
 
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.INFO)
+LOG.addHandler(logging.StreamHandler())
 
 class InfluxDBReporter(object):
     def __init__(self):
@@ -50,7 +53,7 @@ class InfluxDBReporter(object):
                     break
         except Empty:
             pass
-        print len(batch)
+        LOG.info("[InfluxRepository] Sending batch of states %s " % len(batch))
 
     def _sample_sender(self):
         batch = []
@@ -196,8 +199,6 @@ class InfluxDBStateRepository(InfluxDBReporter):
             aligned_time = int(state['latest_call'] - state['latest_call'] % msg['granularity'])
             for bucket in reversed(state['distribution']):
                 if loop_bucket.get_cnt(bucket):
-                    if not float(loop_bucket.get_min(bucket)):
-                        print float(loop_bucket.get_min(bucket))
                     method_sample = {
                         'measurement': 'rpc_method',
                         'time': aligned_time * 1000000000,
