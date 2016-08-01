@@ -11,6 +11,7 @@ LOG = logging.getLogger('RPC State Controller')
 LOG.setLevel(logging.INFO)
 LOG.addHandler(logging.StreamHandler())
 
+
 class FetchingException(Exception):
     pass
 
@@ -23,38 +24,44 @@ class RabbitAPIClient(object):
     Q_BINDINGS = "queues/%(vhost)s/%(queue)s/bindings"
     E_BINDINGS = "exchanges/%(vhost)s/%(exchange)s/bindings/%(type)s"
 
-    def __init__(self):
-        self.config = self.setup_config()
-        self.auth = (self.config.management_user, self.config.management_pass)
-        self.api = self.config.management_url + "/api/%s/"
+    # Setup configuration options
+    opt_group = cfg.OptGroup(name='rabbit_monitor')
+    opts = [cfg.StrOpt('management_url', default='http://localhost:15672'),
+            cfg.StrOpt('management_user', default='guest'),
+            cfg.StrOpt('management_pass', default='guest')]
 
-    @staticmethod
-    def setup_config():
-        opt_group = cfg.OptGroup(name='rabbit_monitor')
-        opts = [cfg.StrOpt('management_url', default='http://localhost:15672'),
-                cfg.StrOpt('management_user', default='guest'),
-                cfg.StrOpt('management_pass', default='guest')]
-        config = cfg.CONF
-        config.register_group(opt_group)
-        config.register_opts(opts, group=opt_group)
-        return config.rabbit_monitor
+    config = cfg.CONF
+    config.register_group(opt_group)
+    config.register_opts(opts, group=opt_group)
+
+    def __init__(self):
+        config = self.get_cfg()
+        self.auth = (config.management_user, config.management_pass)
+        self.api = config.management_url + "/api/%s/"
+
+    @classmethod
+    def get_cfg(cls):
+        return cls.config.rabbit_monitor
 
     def _get(self, resource, data=None):
         r = requests.get(self.api % resource, data, auth=self.auth)
         if r.status_code == 200:
             return r.json()
         else:
-            raise FetchingException("Failed to get %s list: response"
-                                    " code %s" % (resource, r.status_code))
+            raise FetchingException("Failed to get %s list: response code "
+                                    "%s" % (resource, r.status_code))
 
-    def queue_bindings_list(self, queue_name, vhost='%2F'):
-        return self._get(self.Q_BINDINGS % {'vhost': vhost, 'queue': queue_name})
+    def queue_bindings_list(self, queue, vhost='%2F'):
+        params = {'vhost': vhost, 'queue': queue}
+        return self._get(self.Q_BINDINGS % params)
 
-    def exchange_bindings_list(self, exchange_name, btype='source', vhost='%2F'):
-        return self._get(self.E_BINDINGS % {'vhost': vhost, 'exchange': exchange_name, 'type': btype})
+    def exchange_bindings_list(self, exchange, btype='source', vhost='%2F'):
+        params = {'vhost': vhost, 'exchange': exchange, 'type': btype}
+        return self._get(self.E_BINDINGS % params)
 
-    def queue_info(self, queue_name, vhost='%2F'):
-        return self._get(self.QUEUE_INFO % {'vhost': vhost, 'queue': queue_name})
+    def queue_info(self, queue, vhost='%2F'):
+        params = {'vhost': vhost, 'queue': queue}
+        return self._get(self.QUEUE_INFO % params)
 
     def queues_list(self, columns='name,consumers'):
         return self._get(self.QUEUES, data=dict(columns=columns))
@@ -64,34 +71,37 @@ class RabbitAPIClient(object):
 
 
 class AMQPClient(object):
-    # todo: to be configurable
-    REPLY_QUEUE = "openstack_rpc_reply"
+    # Setup configuration options
+    opt_group = cfg.OptGroup('rabbit_monitor')
+    opts = [cfg.StrOpt('amqp_url', default='amqp://guest:guest@localhost'),
+            cfg.StrOpt('reply_to', default='openstack_rpc_reply')]
+    config = cfg.CONF
+    config.register_group(opt_group)
+    config.register_opts(opts, group=opt_group)
 
     def __init__(self, on_incoming):
-        self.config = self.setup_config()
-        self.params = pika.URLParameters(self.config.amqp_url)
-        self.connection = pika.BlockingConnection(parameters=self.params)
+        config = self.get_cfg()
+        self.params = pika.URLParameters(config.amqp_url)
+        self.connection = pika.BlockingConnection(self.params)
         self.channel = self.connection.channel()
-        self.reply_listener = AMQPConsumer(self.config.amqp_url, on_incoming, self.REPLY_QUEUE)
+        self.reply_listener = AMQPConsumer(config.amqp_url,
+                                           on_incoming,
+                                           config.reply_to)
         self.reply_listener.start()
 
-    @staticmethod
-    def setup_config():
-        opt_group = cfg.OptGroup(name='rabbit_monitor')
-        opts = [cfg.StrOpt('amqp_url', default='amqp://guest:guest@localhost:5672')]
-        config = cfg.CONF
+    @classmethod
+    def get_cfg(cls):
+        return cls.config.rabbit_monitor
 
-        config.register_group(opt_group)
-        config.register_opts(opts, group=opt_group)
-        return config.rabbit_monitor
-
-    def _publish(self, msg, exchange='', routing_key='*', reply_queue=None, headers=None):
+    def _publish(self, msg, exchange='', routing_key='*', reply_queue=None,
+                 headers=None):
         # the kombu driver getting a reply queue from  a msg payload
         # conversely the pika driver use message properties
         # to store the queue
         properties = pika.BasicProperties(content_type='application/json',
                                           reply_to=reply_queue,
                                           headers=headers)
+
         self.channel.basic_publish(exchange=exchange,
                                    routing_key=routing_key,
                                    body=json.dumps(msg),
@@ -99,29 +109,29 @@ class AMQPClient(object):
 
 
 class AMQPConsumer(object):
-    def __init__(self, amqp_url, on_incoming, reply_queue="openstack_rpc_reply"):
+    def __init__(self, amqp_url, on_incoming, queue_name):
         self.params = pika.URLParameters(amqp_url)
         self.connection = pika.BlockingConnection(parameters=self.params)
         self.channel = self.connection.channel()
-        self.reply_to = reply_queue
+        self.queue = queue_name
         self.exchange_bindings = []
         self.on_incoming = on_incoming
         self._setup_reply_queue()
         self.consumer_thread = Thread(target=self._consume)
 
     def _setup_reply_queue(self):
-        LOG.info("[AMQP Consumer] Setup reply queue: %s" % self.reply_to)
-        self.channel.queue_declare(self.reply_to)
-        self.channel.exchange_declare(self.reply_to, 'direct',
+        LOG.info("[AMQP Consumer] Setup reply queue: %s" % self.queue)
+        self.channel.queue_declare(self.queue)
+        self.channel.exchange_declare(self.queue, 'direct',
                                       durable=False,
                                       auto_delete=True)
-        self.channel.queue_bind(self.reply_to, self.reply_to, self.reply_to)
+        self.channel.queue_bind(self.queue, self.queue, self.queue)
 
     def _consume(self):
         LOG.info("[AMQP Consumer] Starting consuming rpc states ...")
         self.channel.basic_consume(consumer_callback=self._on_message,
                                    no_ack=True,
-                                   queue=self.reply_to)
+                                   queue=self.queue)
         self.channel.start_consuming()
 
     def _on_message(self, ch, method_frame, header_frame, body):
